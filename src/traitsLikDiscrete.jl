@@ -9,7 +9,7 @@ functions can be applied, like `loglikelihood(object)`, `aic(object)` etc.
 """
 mutable struct StatisticalSubstitutionModel <: StatsBase.StatisticalModel
     model::SubstitutionModel
-    ratemodel::RateVariationAcrossSites #allows rates to vary according to gamma
+    ratemodel::RateVariationAcrossSites
     """stationary for NASM models (log(1/4)), uniform in all other cases"""
     prioratroot::Vector{Float64}
     net::HybridNetwork
@@ -122,7 +122,7 @@ function StatisticalSubstitutionModel(net::HybridNetwork, fastafile::String,
     end
     data, siteweights = readfastatodna(fastafile, true)
     model = defaultsubstitutionmodel(net, modsymbol, data, siteweights)
-    ratemodel = RateVariationAcrossSites(1.0, ratecategories)
+    ratemodel = RateVariationAcrossSites(alpha=1.0, ncat=ratecategories)
     dat2 = traitlabels2indices(view(data, :, 2:size(data,2)), model)
     o, net = check_matchtaxonnames!(data[:,1], dat2, net) # calls resetNodeNumbers, which calls preorder!
     trait = dat2[o]
@@ -138,7 +138,7 @@ function Base.show(io::IO, obj::SSM)
     disp *= string(obj.model)
     disp *= "$(obj.nsites) traits, $(length(obj.trait)) species\n"
     if obj.ratemodel.ncat != 1
-        disp *= "variable rates across sites ~ discretized gamma with\n alpha=$(obj.ratemodel.alpha)"
+        disp *= "variable rates across sites ~ discretized gamma with\n alpha=$(obj.ratemodel.alpha[1])"
         disp *= "\n $(obj.ratemodel.ncat) categories"
         disp *= "\n rate multipliers: $(round.(obj.ratemodel.ratemultiplier, digits=5))\n"
     end
@@ -276,7 +276,7 @@ rate matrix Q:
 on a network with 0 reticulations
 log-likelihood: -4.99274
 
-julia> rv = RateVariationAcrossSites()
+julia> rv = RateVariationAcrossSites(alpha=1.0)
 Rate Variation Across Sites using Discretized Gamma Model
 alpha: 1.0
 categories for Gamma discretization: 4
@@ -308,7 +308,7 @@ using either equal frequencies or stationary frequencies for trait models.
 """
 function fitdiscrete(net::HybridNetwork, model::SubstitutionModel,
     tips::Dict; kwargs...) #tips::Dict no ratemodel version
-    ratemodel = RateVariationAcrossSites(1.0, 1)
+    ratemodel = RateVariationAcrossSites(ncat=1)
     fitdiscrete(net, model, ratemodel, tips; kwargs...)
 end
 
@@ -331,7 +331,7 @@ end
 #dat::DataFrame, no rate model version
 function fitdiscrete(net::HybridNetwork, model::SubstitutionModel,
     dat::DataFrame; kwargs...)
-    ratemodel = RateVariationAcrossSites(1.0, 1)
+    ratemodel = RateVariationAcrossSites(ncat=1)
     fitdiscrete(net, model, ratemodel, dat; kwargs...)
 end
 
@@ -356,7 +356,7 @@ end
 #species, dat version, no ratemodel
 function fitdiscrete(net::HybridNetwork, model::SubstitutionModel,
     species::Array{String}, dat::DataFrame; kwargs...)
-    ratemodel = RateVariationAcrossSites(1.0, 1)
+    ratemodel = RateVariationAcrossSites(ncat=1)
     fitdiscrete(net, model, ratemodel, species, dat; kwargs...)
 end
 
@@ -391,9 +391,9 @@ function fitdiscrete(net::HybridNetwork, modSymbol::Symbol,
     end
 
     if rvSymbol == :RV
-        rvas = RateVariationAcrossSites(1.0, 4)
+        rvas = RateVariationAcrossSites(alpha=1.0, ncat=4)
     else
-        rvas = RateVariationAcrossSites(1.0, 1)
+        rvas = RateVariationAcrossSites(ncat=1)
     end
     fitdiscrete(net, model, rvas, species, dat; kwargs...)
 end
@@ -401,7 +401,7 @@ end
 #dnadata with dnapatternweights version, no ratemodel
 function fitdiscrete(net::HybridNetwork, model::SubstitutionModel,
     dnadata::DataFrame, dnapatternweights::Array{Float64}; kwargs...)
-    ratemodel = RateVariationAcrossSites(1.0, 1)
+    ratemodel = RateVariationAcrossSites(ncat=1)
     fitdiscrete(net, model, ratemodel, dnadata, dnapatternweights; kwargs...)
 end
 
@@ -437,9 +437,9 @@ function fitdiscrete(net::HybridNetwork, modSymbol::Symbol, dnadata::DataFrame,
     end
 
     if rvSymbol == :RV
-        rvas = RateVariationAcrossSites(1.0, 4)
+        rvas = RateVariationAcrossSites(alpha=1.0, ncat=4)
     else
-        rvas = RateVariationAcrossSites(1.0, 1)
+        rvas = RateVariationAcrossSites(ncat=1)
     end
     fitdiscrete(net, model, rvas, dnadata, dnapatternweights; kwargs...)
 end
@@ -542,7 +542,7 @@ function fit!(obj::SSM; optimizeQ=true::Bool, optimizeRVAS=true::Bool,
         NLopt.lower_bounds!(optRVAS, fill(alphamin, (nparRVAS,)) ) # for 0 as lower bound: zeros(Float64, nparRVAS)
         NLopt.upper_bounds!(optRVAS, fill(alphamax, (nparRVAS,)) ) # delete to remove upper bound
         NLopt.max_objective!(optRVAS, loglikfunRVAS)
-        fmax, xmax, ret = NLopt.optimize(optRVAS, [obj.ratemodel.alpha]) # optimization here!
+        fmax, xmax, ret = NLopt.optimize(optRVAS, [obj.ratemodel.alpha[1]]) # optimization here!
         setalpha!(obj.ratemodel, xmax[1])
         obj.loglik = fmax
         verbose && println("RVAS: got $(round(fmax, digits=5)) at $(round.(xmax, digits=5)) after $(optRVAS.numevals) iterations (return code $(ret))")
@@ -554,7 +554,7 @@ function fit!(obj::SSM; optimizeQ=true::Bool, optimizeRVAS=true::Bool,
         obj.loglik = fmax
         verbose && println("got $(round(fmax, digits=5)) at $(round.(xmax, digits=5)) after $(optQ.numevals) iterations (return code $(ret))")
         # optimize RVAS under fixed Q: a second time
-        fmax, xmax, ret = NLopt.optimize(optRVAS, [obj.ratemodel.alpha])
+        fmax, xmax, ret = NLopt.optimize(optRVAS, [obj.ratemodel.alpha[1]])
         setalpha!(obj.ratemodel, xmax[1])
         obj.loglik = fmax
         verbose && println("RVAS: got $(round(fmax, digits=5)) at $(round.(xmax, digits=5)) after $(optRVAS.numevals) iterations (return code $(ret))")
