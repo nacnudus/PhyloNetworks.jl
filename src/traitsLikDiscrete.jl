@@ -56,7 +56,7 @@ mutable struct StatisticalSubstitutionModel <: StatsBase.StatisticalModel
     backwardlik::Array{Float64,2}# size: k, net.numNodes
     "log-likelihood of site k"
     _sitecache::Array{Float64,1} # size: nsites
-    "log-likelihood of ith displayed tree t, given rate category j, of site k"
+    "log-likelihood of ith displayed tree t & rate category j, of site k"
     _loglikcache::Array{Float64, 3} # size: nsites, nrates, ntrees
 
     "inner (default) constructor: from model, rate model, network, trait and site weights"
@@ -620,16 +620,20 @@ function discrete_corelikelihood!(obj::SSM; whichtrait::AbstractVector{Int} = 1:
         for ri in 1:nr
             for ci in whichtrait
                 obj._loglikcache[ci,ri,t] = discrete_corelikelihood_trait!(obj,t,ci,ri)
+                # conditional: log P(site | rate & tree)
                 # note: -Inf expected if 2 tips have different states, but separated by path of total length 0.0
             end
         end
     end
     # aggregate over trees and rates
+    lrw = obj.ratemodel.ratelogweight
     for ti in 1:nt
-        obj._loglikcache[:,:,ti] .+= obj.priorltw[ti]
+        ltprior = obj.priorltw[ti]
+        for ri in 1:nr
+            obj._loglikcache[:,ri,ti] .+= ltprior + lrw[ri]
+            # now unconditional: log P(site & rate & tree)
+        end
     end
-    # obj._loglikcache .-= log(nr)
-    # done below in 1 instead nsites x nrates x ntrees calculations, but _loglikcache not modified
     for ci in whichtrait
         obj._sitecache[ci] = logsumexp(view(obj._loglikcache, ci,:,1:nt))
     end
@@ -637,7 +641,6 @@ function discrete_corelikelihood!(obj::SSM; whichtrait::AbstractVector{Int} = 1:
         obj._sitecache .*= obj.siteweight
     end
     loglik = sum(obj._sitecache)
-    loglik -= log(nr) * obj.totalsiteweight
     obj.loglik = loglik
     return loglik
 end
@@ -742,7 +745,6 @@ function posterior_logtreeweight(obj::SSM, trait = 1)
                             dims=d+1); dims=1)
     if d>0 ts = permutedims(ts); end # now: ts[tree] or ts[tree,site]
     siteliks = mapslices(logsumexp, ts, dims=1) # 1 x ntraits array (or 1-element vector)
-    # -log(nr) missing from both ts and siteliks, but cancels out next
     ts .-= siteliks
     return ts
 end
@@ -938,6 +940,7 @@ function ancestralStateReconstruction(obj::SSM, trait::Integer = 1)
     res = similar(bkd) # first: hold the cumulative logsumexp of bkd + frd + ltw
     fill!(res, -Inf64)
     nr = length(obj.ratemodel.ratemultiplier)
+    lrw = obj.ratemodel.ratelogweight
     for t in 1:length(obj.displayedtree)
         ltprior = ltw[t]
         for ri in 1:nr
@@ -946,12 +949,12 @@ function ancestralStateReconstruction(obj::SSM, trait::Integer = 1)
             # update backward likelihoods
             discrete_backwardlikelihood_trait!(obj,t,ri)
             # P{state i at node n} ∝ bkd[i,n] * frd[i,n] given tree & rate:
-            # res = logaddexp(res, ltw[t] + bkd + frd)  ---   -log(nr) will cancel out
-            broadcast!(logaddexp, res, res, ltprior .+ bkd + frd)
+            # res = logaddexp(res, ltw[t] + lrw[ri] + bkd + frd)
+            broadcast!(logaddexp, res, res, (ltprior + lrw[ri]) .+ bkd .+ frd)
         end
     end
     # normalize the results at each node: p_i / sum(p_j over all states j)
-    traitloglik = logsumexp(res[:,1]) # sum p_j at node 1 or at any node = loglikelihood + log(nr)
+    traitloglik = logsumexp(res[:,1]) # sum p_j at node 1 or at any node = loglikelihood
     res .= exp.(res .- traitloglik)
     nodestringlabels = Vector{String}(undef, nnodes)
     for n in obj.net.node

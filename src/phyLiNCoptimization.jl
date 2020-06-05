@@ -52,7 +52,7 @@ See constructor below, from a `StatisticalSubstitutionModel`.
 struct CacheLengthLiNC
     """forward likelihood of descendants of focus edge: nstates x nsites x nrates x ntrees"""
     flike::Array{Float64,4}
-    """likelihood of non-descendants of focus edge: direct * backwards.
+    """likelihood of non-descendants of focus edge: direct * backwards * P(rate & tree).
        size: nstates x nsites x nrates x ntrees"""
     dblike::Array{Float64,4}
     """whether displayed trees have the focus edge (true) or not (false),
@@ -704,6 +704,7 @@ function nni_LiNC!(obj::SSM, no3cycle::Bool, nohybridladder::Bool,
         updateSSM!(obj, true; constraints=constraints)
         optimizelocalgammas_LiNC!(obj, e1, ftolAbs, γcache)
         # don't delete a hybrid edge with γ=0: to be able to undo the NNI
+        # but: there's no point in optimizing the length of such an edge
         optimizelocalBL_LiNC!(obj, e1, lcache)
         if obj.loglik < currLik
             nni!(undoinfo...) # undo move
@@ -881,7 +882,7 @@ function deletehybridedgeLiNC!(obj::SSM, currLik::Float64,
     majhyb = getMajorParentEdge(hybridnode)
     len0 = majhyb.length # to restore later if deletion rejected
     update_logtrans(obj) # fixit: is that really needed?
-    optimizelength_LiNC!(obj, majhyb, lcache, Q(obj.model), exp.(obj.priorltw))
+    optimizelength_LiNC!(obj, majhyb, lcache, Q(obj.model))
     # don't optimize gammas: because we want to constrain one of them to 0.0
     if obj.loglik - currLik > likAbsDelHybLiNC # -0.1: loglik can decrease for parsimony
         deletehybridedge!(obj.net, minorhybridedge, false,true,false,false) # nofuse,unroot,multgammas,simplify
@@ -1153,6 +1154,8 @@ function updatecache_edge!(lcache::CacheLengthLiNC, obj::SSM, focusedge)
             hassis[j,it] = any(x -> x.number == snum[j], tree[it].edge)
         end
     end
+    lrw  = obj.ratemodel.ratelogweight
+    ltw  = obj.priorltw
     ftmp = obj.forwardlik
     btmp = obj.backwardlik
     dtmp = obj.directlik
@@ -1160,11 +1163,13 @@ function updatecache_edge!(lcache::CacheLengthLiNC, obj::SSM, focusedge)
     fill!(flike, -Inf); fill!(dblike, -Inf)
     for it in 1:nt
         if hase[it] # we do need flike and dblike
-        for ir in 1:nr for is in 1:ns
-            clik[is,ir,it] = discrete_corelikelihood_trait!(obj, it,is,ir)
+        for ir in 1:nr
+          ltrw = ltw[it] + lrw[ir]
+          for is in 1:ns
+            clik[is,ir,it] = discrete_corelikelihood_trait!(obj, it,is,ir) # ! +ltrw not needed
             discrete_backwardlikelihood_trait!(obj, it,ir)
             flike[:,is,ir,it]  .= ftmp[:,unum]
-            dblike[:,is,ir,it] .= btmp[:,vnum]
+            dblike[:,is,ir,it] .= btmp[:,vnum] .+ ltrw
             for isis in 1:nsis
             @inbounds if hassis[isis,it]
                 dblike[:,is,ir,it] .+= dtmp[:,snum[isis]] # sum on log scale
@@ -1172,8 +1177,10 @@ function updatecache_edge!(lcache::CacheLengthLiNC, obj::SSM, focusedge)
             end
         end; end
         else # tree does't have the focus edge: use clik only
-        for ir in 1:nr for is in 1:ns
-            clik[is,ir,it] = discrete_corelikelihood_trait!(obj, it,is,ir)
+        for ir in 1:nr
+          ltrw = ltw[it] + lrw[ir]
+          for is in 1:ns
+            clik[is,ir,it] = discrete_corelikelihood_trait!(obj, it,is,ir) + ltrw
         end; end
         end
     end
@@ -1208,10 +1215,9 @@ function optimizealllengths_LiNC!(obj::SSM, lcache::CacheLengthLiNC)
     end
     update_logtrans(obj)
     qmat  = Q(obj.model)
-    ltw = exp.(obj.priorltw)
     Random.shuffle!(edges)
     for e in edges
-        optimizelength_LiNC!(obj, e, lcache, qmat, ltw)
+        optimizelength_LiNC!(obj, e, lcache, qmat)
     end
     return edges # excludes constrained edges
 end
@@ -1261,11 +1267,13 @@ julia> writeTopology(obj.net; round=true)
 """
 function optimizelocalBL_LiNC!(obj::SSM, focusedge::Edge, lcache::CacheLengthLiNC)
     neighboredges = adjacentedges(focusedge)
-    # remove constrained edges: to keep network unzipped
+    # remove from neighboredges (shallow copy!)
+    #  - constrained edges: to keep network unzipped, and
+    #  - and any hybrid edge with γ=0
     if !isempty(obj.net.hybrid)
         @inbounds for i in length(neighboredges):-1:1
             e = neighboredges[i]
-            getParent(e).hybrid && deleteat!(neighboredges, i) # shallow copy!!
+            (getParent(e).hybrid || e.gamma == 0.0) && deleteat!(neighboredges, i)
         end
     end
     # reduce edge lengths beyond upper bounds: can appear from unzipping,
@@ -1275,16 +1283,14 @@ function optimizelocalBL_LiNC!(obj::SSM, focusedge::Edge, lcache::CacheLengthLiN
     # assume: correct preordered displayed trees & tree weights
     update_logtrans(obj) # fixit: waste of time? avoid in some cases?
     qmat  = Q(obj.model)
-    ltw = exp.(obj.priorltw)
     for e in neighboredges
-        optimizelength_LiNC!(obj, e, lcache, qmat, ltw)
+        optimizelength_LiNC!(obj, e, lcache, qmat)
     end
     return neighboredges # excludes constrained edges
 end
 
 """
-    optimizelength_LiNC!(obj::SSM, edge::Edge, cache::CacheLengthLiNC,
-                         Qmatrix, treeweights)
+    optimizelength_LiNC!(obj::SSM, edge::Edge, cache::CacheLengthLiNC, Qmatrix)
 
 Optimize the length of a single `edge` using a gradient method.
 Output: nothing.
@@ -1293,12 +1299,14 @@ Warnings:
 - displayed trees are assumed up-to-date, with nodes preordered
 - no check that `edge` is not below a reticulation (the unzipped canonical
   version should have a length of 0 below reticulations).
+- will fail on an edge with γ=0
 """
 function optimizelength_LiNC!(obj::SSM, focusedge::Edge,
-                          lcache::CacheLengthLiNC, qmat, ltw)
+                              lcache::CacheLengthLiNC, qmat)
     cfg = updatecache_edge!(lcache, obj, focusedge)
-    flike  = lcache.flike
-    dblike = lcache.dblike
+    flike  = lcache.flike  # P(descendants of e | state at child, rate, tree)
+    dblike = lcache.dblike # P(non-descendants & state at parent, rate, tree)
+    # ! if γ=0 then dblike starts as all -Inf because P(tree) = 0 -> problem
     hase   = lcache.hase
     Prt    = lcache.Prt
     rQP    = lcache.rQP
@@ -1307,9 +1315,9 @@ function optimizelength_LiNC!(obj::SSM, focusedge::Edge,
     k, ns, nr, nt = size(flike)
     nt = length(tree) # could be less than dimension in lcache
     rates = obj.ratemodel.ratemultiplier
-    ulik  = obj._sitecache   # unconditional likelihood
-    clik  = obj._loglikcache # conditional likelihood
-    adjustment = obj.totalsiteweight * (cfg - log(nr))
+    ulik  = obj._sitecache   # will hold P(site): depends on length of e
+    clik  = obj._loglikcache # P(site & rate, tree) using old length of e
+    adjustment = obj.totalsiteweight * cfg
 
     # use site weights, if any
     wsum = (isnothing(obj.siteweight) ? sum : x -> sum(x .* obj.siteweight))
@@ -1326,26 +1334,21 @@ function optimizelength_LiNC!(obj::SSM, focusedge::Edge,
         for it in 1:nt
         if hase[it] # tree has edge: contributes to gradient
             for is in 1:ns
-                u=0.0; g=0.0
                 for ir in 1:nr
                     # dot(x,A,y) requires Julia 1.4, and fails with Optim v0.19.3
                     # u += dot(dblike[:,is,ir,it], Prt[ir], flike[:,is,ir,it])
                     # g += dot(dblike[:,is,ir,it], rQP[ir], flike[:,is,ir,it])
                     @inbounds for i in 1:k for j in 1:k
-                        u += dblike[i,is,ir,it] * Prt[ir][i,j] * flike[j,is,ir,it]
-                        g += dblike[i,is,ir,it] * rQP[ir][i,j] * flike[j,is,ir,it]
+                        ulik[is] += dblike[i,is,ir,it] * Prt[ir][i,j] * flike[j,is,ir,it]
+                        glik[is] += dblike[i,is,ir,it] * rQP[ir][i,j] * flike[j,is,ir,it]
                     end; end
                 end
-                ulik[is] += u * ltw[it]
-                glik[is] += g * ltw[it]
             end
         else # tree doesn't have focus edge: use clik only, gradient=0
             for is in 1:ns
-                u=0.0
                 for ir in 1:nr
-                    u += clik[is,ir,it] # already exp-ed inside updatecache_edge!
+                    ulik[is] += clik[is,ir,it] # already exp-ed inside updatecache_edge!
                 end
-                ulik[is] += u * ltw[it]
             end
         end
         end
@@ -1586,7 +1589,7 @@ function optimizegamma_LiNC!(obj::SSM, focusedge::Edge,
         updateSSM_priorltw!(obj)
         discrete_corelikelihood!(obj) # to update obj._loglikcache
     end
-    # obj._loglikcache[site,rate,tree] = log P(site | tree,rate) + log gamma(tree)
+    # obj._loglikcache[site,rate,tree] = log P(site & tree,rate)
     cadjust = maximum(view(llca, :,:,1:nt)) # to avoid underflows
     nr = length(obj.ratemodel.ratemultiplier)
     visib = true # whether the reticulation is visible in *all* displayed trees
@@ -1610,8 +1613,8 @@ function optimizegamma_LiNC!(obj::SSM, focusedge::Edge,
     ## step 2: Newton-Raphson
     clike ./= γ0
     clikp ./= 1.0 - γ0
-    adjustment = obj.totalsiteweight * (log(nr) - cadjust)
-    ll = obj.loglik + adjustment
+    adjustment = obj.totalsiteweight * cadjust
+    ll = obj.loglik - adjustment
     wsum = (obj.siteweight === nothing ? sum : x -> sum(obj.siteweight .* x))
     # evaluate if best γ is at the boundary: 0 or 1
     if visib # true most of the time (all the time if tree-child)
@@ -1678,7 +1681,7 @@ function optimizegamma_LiNC!(obj::SSM, focusedge::Edge,
         # if this was problematic for constraints, restrict the search
         # to interval [0,0.5] or [0.5,1] as appropriate
     end
-    ll -= adjustment
+    ll += adjustment
     obj.loglik = ll
     lγdiff = log(γ) - log(γ0); l1mγdiff = log(1.0-γ) - log(1.0-γ0)
     for it in 1:nt
